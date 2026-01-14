@@ -1,297 +1,417 @@
 package us.ajg0702.antixray;
 
-import net.kyori.adventure.platform.bukkit.BukkitAudiences;
 import org.bukkit.Bukkit;
+import org.bukkit.NamespacedKey;
 import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.spongepowered.configurate.ConfigurateException;
 import us.ajg0702.antixray.hooks.Hook;
 import us.ajg0702.antixray.hooks.HookRegistry;
-import us.ajg0702.antixray.hooks.SavageFactions;
 import us.ajg0702.antixray.hooks.WorldGuard;
 import us.ajg0702.utils.common.Config;
 import us.ajg0702.utils.common.Messages;
 
 import java.util.*;
+import java.util.Locale;
+import java.util.concurrent.ConcurrentHashMap; // CHANGED (Folia): use thread-safe collections
 import java.util.logging.Level;
 
 public class Main extends JavaPlugin {
 
-	private HookRegistry hookRegistry;
-	
-	Map<UUID, Map<Long, String>> players = new HashMap<>();
-	
-	List<String> blocks;
-	Map<String, Integer> warnBlocks = new HashMap<>();
-	int delay;
-	
-	List<String> disabledWorlds;
-	
-	Messages messages;
+    private HookRegistry hookRegistry;
+    private String serverName = "Unknown";
 
-	Config config;
-	
-	int ignoreAbove = 64;
+    // CHANGED (Folia): ConcurrentHashMap because this map is accessed from multiple schedulers/threads
+    // (event thread, global region scheduler, async scheduler).
+    final Map<UUID, Map<Long, String>> players = new ConcurrentHashMap<>();
 
-	private BukkitAudiences adventure;
-	
-	Map<String, Integer> getBlocks(UUID uuid) {
-		Map<String, Integer> bks = new HashMap<>();
-		for(String block : blocks) {
-			bks.put(block, 0);
-		}
-		Map<Long, String> player = players.get(uuid);
-		if(player == null) {
-			player = new HashMap<>();
-		}
-		Iterator<Long> i = player.keySet().iterator();
-		while(i.hasNext()) {
-			 long t = i.next();
-			if(t < System.currentTimeMillis()-delay) {
-				i.remove();
-			} else {
-				String bk = player.get(t);
-				int before = bks.get(bk);
-				bks.put(bk, before+1);
-			}
-		}
-		players.put(uuid, player);
-		return bks;
-	}
-	
-	boolean blockDebug;
-	
-	List<String> commands;
-	
-	String notifySound = "NONE";
-	
-	
-	void reloadMainConfig() {
-		try {
-			config.reload();
-		} catch (ConfigurateException e) {
-			getLogger().log(Level.WARNING, "Unable to reload config: ", e);
-			return;
-		}
-		List<String> blocksTemp = config.getStringList("blocks");
-		blocks = new ArrayList<>();
-		warnBlocks = new HashMap<>();
-		for(String block : blocksTemp) {
-			String[] parts = block.split(":");
-			if(parts.length > 1 && (parts[0] != null || parts[1] != null)) {
-				warnBlocks.put(parts[0], Integer.parseInt(parts[1]));
-				blocks.add(parts[0]);
-			} else {
-				Bukkit.getLogger().warning("[ajAntiXray] The block " + block + " does not have a warning amount set! It will not notify admins!");
-				warnBlocks.put(block, Integer.MAX_VALUE);
-				blocks.add(block);
-			}
-		}
-		delay = config.getInt("blocks-in-last-minutes") * 60000;
+    List<String> blocks;
+    Map<String, Integer> warnBlocks = new HashMap<>();
+    int delay;
+
+    List<String> disabledWorlds;
+
+    Messages messages;
+
+    Config config;
+
+    int ignoreAbove = 64;
+
+    // CHANGED (Folia): keep this as a method-local HashMap (safe), but the per-player map stored in
+    // `players` should also be concurrent / safely mutated.
+    Map<String, Integer> getBlocks(UUID uuid) {
+        Map<String, Integer> bks = new HashMap<>();
+        for (String block : blocks) {
+            bks.put(block, 0);
+        }
+
+        // CHANGED (Folia): ensure the player map exists and is thread-safe.
+        Map<Long, String> player = players.computeIfAbsent(uuid, k -> new ConcurrentHashMap<>());
+
+        // CHANGED (Folia): iterating + removing while other threads might write is safe on CHM via iterator.remove?
+        // CHM's iterators do NOT support remove(). So we do a two-pass approach.
+        long cutoff = System.currentTimeMillis() - delay;
+        List<Long> toRemove = new ArrayList<>();
+
+        for (Map.Entry<Long, String> entry : player.entrySet()) {
+            long t = entry.getKey();
+            if (t < cutoff) {
+                toRemove.add(t);
+                continue;
+            }
+            String bk = entry.getValue();
+            Integer before = bks.get(bk);
+            if (before == null) continue;
+            bks.put(bk, before + 1);
+        }
+
+        // CHANGED (Folia): remove old entries after iteration
+        for (Long t : toRemove) {
+            player.remove(t);
+        }
+
+        return bks;
+    }
+
+    boolean blockDebug;
+
+    List<String> commands;
+
+    String notifySound = "NONE";
 
 
-		Hook wgHook = getHookRegistry().getHook(WorldGuard.class);
-		Hook sfHook = getHookRegistry().getHook(SavageFactions.class);
+    void reloadMainConfig() {
+        try {
+            config.reload();
+        } catch (ConfigurateException e) {
+            getLogger().log(Level.WARNING, "Unable to reload config: ", e);
+            return;
+        }
 
-		if(wgHook != null) {
-			wgHook.setEnabled(config.getBoolean("worldguard-integration"));
-		}
-		sfHook.setEnabled(config.getBoolean("factions-integration"));
+        serverName = config.getString("server-name");
+        if (serverName == null || serverName.isBlank()) serverName = "Unknown-Server";
 
-		if(wgHook != null && wgHook.isEnabled()) {
-			getLogger().info("Enabled WorldGuard hook and flag!");
-		}
-		if(sfHook.isEnabled()) {
-			getLogger().info("Enabled SavageFactions hook and flag!");
-		}
+        List<String> blocksTemp = config.getStringList("blocks");
+        blocks = new ArrayList<>();
+        warnBlocks = new HashMap<>();
+        for (String block : blocksTemp) {
+            String[] parts = block.split(":");
+            if (parts.length > 1 && (parts[0] != null || parts[1] != null)) {
+                warnBlocks.put(parts[0], Integer.parseInt(parts[1]));
+                blocks.add(parts[0]);
+            } else {
+                Bukkit.getLogger().warning("[ajAntiXray] The block " + block + " does not have a warning amount set! It will not notify admins!");
+                warnBlocks.put(block, Integer.MAX_VALUE);
+                blocks.add(block);
+            }
+        }
+        delay = config.getInt("blocks-in-last-minutes") * 60000;
 
-		disabledWorlds = config.getStringList("disabled-worlds");
+        Hook wgHook = getHookRegistry().getHook(WorldGuard.class);
 
-		blockDebug = config.getBoolean("block-debug");
+        if (wgHook != null) {
+            wgHook.setEnabled(config.getBoolean("worldguard-integration"));
+        }
+        if (wgHook != null && wgHook.isEnabled()) {
+            getLogger().info("Enabled WorldGuard hook and flag!");
+        }
 
-		commands = config.getStringList("commands-to-execute");
+        disabledWorlds = config.getStringList("disabled-worlds");
+        blockDebug = config.getBoolean("block-debug");
+        commands = config.getStringList("commands-to-execute");
+        ignoreAbove = config.getInt("ignore-above-y");
+        notifySound = config.getString("notify-sound");
+    }
 
-		ignoreAbove = config.getInt("ignore-above-y");
+    Metrics stats;
 
-		notifySound = config.getString("notify-sound");
+    @Override
+    public void onLoad() {
 
-	}
-	
-	Metrics stats;
+        try {
+            config = new Config(getDataFolder(), getLogger());
+        } catch (ConfigurateException e) {
+            getLogger().log(Level.SEVERE, "Failed to load config", e);
+            Bukkit.getPluginManager().disablePlugin(this);
+            return;
+        }
 
-	@Override
-	public void onLoad() {
+        hookRegistry = new HookRegistry();
 
-		try {
-			config = new Config(getDataFolder(), getLogger());
-		} catch (ConfigurateException e) {
-			getLogger().log(Level.SEVERE, "Failed to load config", e);
-			Bukkit.getPluginManager().disablePlugin(this);
-			return;
-		}
+        try {
+            if (config.getBoolean("worldguard-hook")) {
+                hookRegistry.add(new WorldGuard(this, false));
+            }
+        } catch (NoClassDefFoundError ignored) {
+        }
 
-		hookRegistry = new HookRegistry();
+    }
 
-		try {
-			if(config.getBoolean("worldguard-hook")) {
-				hookRegistry.add(new WorldGuard(this, false));
-			}
-		} catch(NoClassDefFoundError ignored) {}
-		hookRegistry.add(new SavageFactions(this, false));
-	}
+    @Override
+    public void onEnable() {
 
-	@Override
-	public void onEnable() {
-
-		this.adventure = BukkitAudiences.create(this);
-		
-		try {
-			stats = new Metrics(this);
-		} catch (Exception e) {
-			Bukkit.getLogger().warning("[ajAntiXray] An error occured while trying to start bStats: " + e.getMessage());
-		}
-		
-		
-		Commands commands = new Commands(this);
-
-		getServer().getPluginManager().registerEvents(new Listener(this), this);
-		getCommand("ajantixray").setExecutor(commands);
-		getCommand("ajecho").setExecutor(commands);
-
-		LinkedHashMap<String, Object> msgDefaults = new LinkedHashMap<>();
-		msgDefaults.put("get.header", "&9Ores mined for {PLAYER}");
-		msgDefaults.put("get.format", "&b{BLOCK}&6: {COUNTCOLOR}{COUNT} &3in last {DELAY} minutes");
-		msgDefaults.put("notify.format", "<hover:show_text:'<green>Click to teleport to {PLAYER}'><click:run_command:/tp {PLAYER}>&cajAntiXray&7<bold>></bold> &a{PLAYER} &2has mined &a{COUNT} {ORE}s &2in the past {DELAY} minutes! They might be xraying..</click></hover>");
-		msgDefaults.put("webhook.format", "**{PLAYER}** has mined **{COUNT} {ORE}s** in the past {DELAY} minutes! They might be xraying..");
-		msgDefaults.put("must-be-ingame", "&cYou must be in-game to do that!");
-		msgDefaults.put("player-not-found", "&cCould not find the player {PLAYER}");
-		msgDefaults.put("noperm", "&cYou do not have permission to do this!");
-		msgDefaults.put("cmd-syntax", "&cUsage: &a/{CMD} <player>");
-		msgDefaults.put("config-reloaded", "&aConfig and messages reloaded!");
-
-		messages = new Messages(getDataFolder(), getLogger(), msgDefaults);
-
-		reloadMainConfig();
-
-		
-		Bukkit.getScheduler().runTaskTimer(this, this::notifyAdmins, 20, 120*20);
-		
-		Bukkit.getConsoleSender().sendMessage("§aajAntiXray §2v§a"+this.getDescription().getVersion()+" §2made by §aajgeiss0702 §2has been enabled!");
-	}
-
-	public Config getAConfig() {
-		return config;
-	}
-
-	public Messages getMessages() {
-		return messages;
-	}
-
-	public HookRegistry getHookRegistry() {
-		return hookRegistry;
-	}
-
-	@Override
-	public void onDisable() {
-		if(this.adventure != null) {
-			this.adventure.close();
-			this.adventure = null;
-		}
-		Bukkit.getConsoleSender().sendMessage("§cajAntiXray §4v§c"+this.getDescription().getVersion()+" §4made by §cajgeiss0702 §4has been disabled!");
-	}
-	
-	Map<UUID, Long> lastNotify = new HashMap<UUID, Long>();
-	
-	List<Player> recentNotifees = new ArrayList<Player>();
-	
-
-	void notifyAdmins(Player player) {
-		
-		if(player == null) {
-			return;
-		} else if(!player.isOnline()) {
-			return;
-		}
-		
-		UUID puuid = player.getUniqueId();
-		Map<String, Integer> bks = this.getBlocks(puuid);
-		for(String bk : bks.keySet()) {
-			if(bks.get(bk) >= warnBlocks.get(bk)) {
-				if(recentNotifees.contains(player)) {
-					recentNotifees.remove(player);
-					//Bukkit.getLogger().info("[ajAntiXray] Skipping player " + player.getName());
-					break;
-				}
-				lastNotify.put(puuid, System.currentTimeMillis());
-				//Bukkit.getLogger().info("[ajAntiXray] "+i+"/"+(bks.keySet().size()-2));
-				Bukkit.getScheduler().runTaskLater(this, new Runnable(){
-					public void run() {
-						if(!recentNotifees.contains(player)) {
-							recentNotifees.add(player);
-						}
-						for(Player admin : Bukkit.getOnlinePlayers()) {
-							if(!admin.hasPermission("ajaxr.notify")) continue;
-							adventure.player(admin).sendMessage(messages.getComponent(
-									"notify.format",
-									"PLAYER:" + player.getName(),
-									"COUNT:" + bks.get(bk),
-									"ORE:" + bk,
-									"DELAY:" + (delay/60000)
-							));
-						}
-						if(!notifySound.equalsIgnoreCase("none")) {
-							for(Player p : Bukkit.getOnlinePlayers()) {
-								if(p.hasPermission("ajaxr.notify")) {
-									try {
-										Sound sound = Sound.valueOf(notifySound);
-										p.playSound(p.getLocation(), sound, 1f, 1f);
-									} catch(Exception e) {
-										Bukkit.getLogger().warning("[ajAntiXray] Could not find sound '"+notifySound+"'!");
-										break;
-									}
-								}
-							}
-						}
-						for(String command : commands) {
-							Bukkit.dispatchCommand(Bukkit.getConsoleSender(), command.replaceAll("\\{PLAYER}", player.getName())
-								.replaceAll("\\{COUNT}", bks.get(bk)+"")
-								.replaceAll("\\{ORE}", bk)
-								.replaceAll("\\{DELAY}", (delay/60000)+"")
-								);
-						}
-
-						String webhookUrl = config.getString("discord-webhook");
-						if(!webhookUrl.isEmpty()) {
-							String webhookMessage = messages.getString(
-									"webhook.format",
-									"PLAYER:" + player.getName(),
-									"COUNT:" + bks.get(bk),
-									"ORE:" + bk,
-									"DELAY:" + (delay/60000)
-							);
-							WebhookSender.send(getLogger(), webhookUrl, webhookMessage);
-						}
-					}
-				}, (long) (Math.floor((Math.random()*2) * 20)));
-			}
-		}
-	}
-	
-	private void notifyAdmins() {
-		for(UUID puuid : players.keySet()) {
-			notifyAdmins(Bukkit.getPlayer(puuid));
-		}
-	}
-	
-	
-	@SuppressWarnings("unlikely-arg-type")
+        try {
+            stats = new Metrics(this);
+        } catch (Exception e) {
+            Bukkit.getLogger().warning("[ajAntiXray] An error occured while trying to start bStats: " + e.getMessage());
+        }
 
 
-	public BukkitAudiences adventure() {
-		if(this.adventure == null) {
-			throw new IllegalStateException("Tried to access Adventure when the plugin was disabled!");
-		}
-		return this.adventure;
-	}
+        Commands commands = new Commands(this);
+
+        getServer().getPluginManager().registerEvents(new Listener(this), this);
+        getCommand("ajantixray").setExecutor(commands);
+        getCommand("ajecho").setExecutor(commands);
+
+        LinkedHashMap<String, Object> msgDefaults = new LinkedHashMap<>();
+        msgDefaults.put(
+                "get.header",
+                "&9Ores mined for &b{PLAYER}&9:");
+        msgDefaults.put(
+                "get.format",
+                "&b{BLOCK}&6: {COUNTCOLOR}{COUNT} &3in last &b{DELAY}&3 minutes");
+        msgDefaults.put(
+                "notify.format",
+                "<hover:show_text:'<green>Click to teleport to {PLAYER}'><click:run_command:/tp {PLAYER}>&cajAntiXray&7<bold>></bold> &a{PLAYER} &2has mined &a{COUNT} {ORE}s &2in the past {DELAY} minutes! They might be xraying..</click></hover>");
+        msgDefaults.put(
+                "webhook.format",
+                "{ROLE_PING}**{SERVER}:** **{PLAYER}** has mined **{COUNT} {ORE}s** in the past {DELAY} minutes! They might be xraying..");
+        msgDefaults.put(
+                "must-be-ingame",
+                "&cYou must be in-game to do that!");
+        msgDefaults.put(
+                "player-not-found",
+                "&cCould not find the player {PLAYER}");
+        msgDefaults.put(
+                "noperm",
+                "&cYou do not have permission to do this!");
+        msgDefaults.put(
+                "cmd-syntax",
+                "&cUsage: &a/{CMD} <player>");
+        msgDefaults.put(
+                "config-reloaded",
+                "&aConfig and messages reloaded!");
+
+        messages = new Messages(getDataFolder(), getLogger(), msgDefaults);
+
+        reloadMainConfig();
+
+        // CHANGED (Folia): global region scheduler is correct for repeating global task
+        Bukkit.getGlobalRegionScheduler().runAtFixedRate(this, task -> notifyAdmins(), 20L, 120L * 20L);
+
+        Bukkit.getConsoleSender().sendMessage("§aajAntiXray §2v§a" + this.getDescription().getVersion() + " §2made by §aajgeiss0702 §2has been enabled!");
+    }
+
+    public Config getAConfig() {
+        return config;
+    }
+
+    public Messages getMessages() {
+        return messages;
+    }
+
+    public HookRegistry getHookRegistry() {
+        return hookRegistry;
+    }
+
+    @Override
+    public void onDisable() {
+        Bukkit.getConsoleSender().sendMessage("§cajAntiXray §4v§c" + this.getDescription().getVersion() + " §4made by §cajgeiss0702 §4has been disabled!");
+    }
+
+    // CHANGED (Folia): thread-safe map
+    final Map<UUID, Long> lastNotify = new ConcurrentHashMap<>();
+
+    // CHANGED (Folia): do NOT store Player objects across schedulers; store UUIDs instead
+    final Set<UUID> recentNotifees = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+
+    void notifyAdmins(Player player) {
+
+        if (player == null || !player.isOnline()) {
+            return;
+        } else if (player.hasPermission("ajaxr.exempt")) {
+            return;
+        }
+
+        final UUID puuid = player.getUniqueId();
+        final Map<String, Integer> bks = this.getBlocks(puuid);
+
+        for (Map.Entry<String, Integer> entry : bks.entrySet()) {
+            final String ore = entry.getKey();
+            final Integer count = entry.getValue();
+            final Integer max = warnBlocks.get(ore);
+
+            if (count == null || max == null) continue;
+
+            if (count >= max) {
+
+                // Folia: use UUID set instead of Player list
+                if (recentNotifees.contains(puuid)) {
+                    recentNotifees.remove(puuid);
+                    break;
+                }
+
+                lastNotify.put(puuid, System.currentTimeMillis());
+
+                // snapshot everything used later
+                final NotifyCtx ctx = new NotifyCtx(
+                        puuid,
+                        player.getName(),
+                        count,
+                        ore,
+                        delay / 60000,
+                        serverName
+                );
+
+                // Folia: resolve sound ONCE (not per-player) + validate
+                final Sound notifyBukkitSound;
+                if (notifySound != null && !notifySound.equalsIgnoreCase("none")) {
+                    NamespacedKey key = NamespacedKey.minecraft(notifySound.toLowerCase(Locale.ROOT));
+                    notifyBukkitSound = Bukkit.getRegistry(Sound.class).get(key);
+                    if (notifyBukkitSound == null) {
+                        Bukkit.getLogger().warning("[ajAntiXray] Invalid notify-sound: " + notifySound);
+                    }
+                } else {
+                    notifyBukkitSound = null;
+                }
+
+                scheduleNotifyAndActions(ctx, notifyBukkitSound);
+            }
+        }
+    }
+
+    private void notifyAdmins() {
+        // CHANGED (Folia): iterate over snapshot of keys to avoid concurrent modification surprises
+        for (UUID puuid : new ArrayList<>(players.keySet())) {
+            Player p = Bukkit.getPlayer(puuid);
+            if (p != null) {
+                notifyAdmins(p);
+            }
+        }
+
+        // prune once per sweep, not per player
+        pruneDiscordDedupeIfNeeded();
+    }
+
+
+    private record NotifyCtx(UUID puuid, String playerName, int minedCount, String ore, int delayMinutes, String serverName) {}
+
+    private void scheduleNotifyAndActions(NotifyCtx ctx, Sound notifyBukkitSound){
+        long delayTicks = java.util.concurrent.ThreadLocalRandom.current().nextLong(1, 41);
+
+        Bukkit.getGlobalRegionScheduler().runDelayed(this, task -> {
+            recentNotifees.add(ctx.puuid());
+
+            notifyOnlineAdmins(ctx, notifyBukkitSound);
+            runConsoleCommands(ctx);
+            sendWebhookAsync(ctx);
+        }, delayTicks);
+    }
+
+    private String[] msgArgs(NotifyCtx c, String rolePing) {
+        return new String[] {
+                "PLAYER:" + c.playerName(),
+                "COUNT:" + c.minedCount(),
+                "ORE:" + c.ore(),
+                "DELAY:" + c.delayMinutes(),
+                "SERVER:" + c.serverName(),
+                "ROLE_PING:" + (rolePing == null ? "" : rolePing)
+        };
+    }
+
+    /** Feed in player data and notify anyone who has the admin permissions and play a sound provided by the config*/
+    private void notifyOnlineAdmins(NotifyCtx ctx, Sound notifyBukkitSound) {
+        final String[] args = msgArgs(ctx, "");
+
+        for (Player admin : Bukkit.getOnlinePlayers()) {
+            if (!admin.hasPermission("ajaxr.notify")) continue;
+
+            admin.getScheduler().run(this, adminTask -> {
+                admin.sendMessage(messages.getComponent("notify.format", args));
+                if (notifyBukkitSound != null) {
+                    admin.playSound(admin.getLocation(), notifyBukkitSound, 1f, 1f);
+                }
+            }, null);
+        }
+    }
+
+    private void runConsoleCommands(NotifyCtx ctx) {
+        for (String command : commands) {
+            Bukkit.dispatchCommand(
+                    Bukkit.getConsoleSender(),
+                    command.replace("{PLAYER}", ctx.playerName())
+                            .replace("{COUNT}", String.valueOf(ctx.minedCount()))
+                            .replace("{ORE}", ctx.ore())
+                            .replace("{DELAY}", String.valueOf(ctx.delayMinutes()))
+                            .replace("{SERVER}", ctx.serverName())
+            );
+        }
+    }
+
+    private void sendWebhookAsync(NotifyCtx ctx) {
+        //Grab webhook information
+        final String webhookUrl = config.getString("discord-webhook");
+        if (webhookUrl == null || webhookUrl.isEmpty()) return;
+
+        // Discord-only dedupe/cooldown
+        if (!shouldSendDiscord(ctx)) return;
+
+        // Grab role ping and threshold
+        final String roleId = config.getString("discord-webhook-role-id");
+        final int pingThreshold = config.getInt("discord-webhook-role-threshold");
+        final String rolePing =
+                (roleId != null && !roleId.isBlank() && ctx.minedCount() >= pingThreshold)
+                        ? "<@&" + roleId.trim() + "> "
+                        : "";
+
+        // Put together message to be sent
+        final String webhookMessage = messages.getString("webhook.format", msgArgs(ctx, rolePing));
+
+        Bukkit.getAsyncScheduler().runNow(this, asyncTask ->
+                WebhookSender.send(getLogger(), webhookUrl, webhookMessage)
+        );
+    }
+
+    private final Map<String, Long> discordLastSent = new ConcurrentHashMap<>();
+
+    private String discordDedupeKey(NotifyCtx ctx) {
+        boolean perServer = config.getBoolean("discord-per-server");
+        if (perServer) {
+            return ctx.serverName() + "|" + ctx.puuid() + "|" + ctx.ore();
+        }
+        return ctx.puuid() + "|" + ctx.ore();
+    }
+
+    private boolean shouldSendDiscord(NotifyCtx ctx) {
+        int dedupeMinutes = config.getInt("discord-dedupe-minutes");
+        if (dedupeMinutes <= 0) {
+            return true; // disabled
+        }
+
+        long windowMs = dedupeMinutes * 60_000L;
+        long now = System.currentTimeMillis();
+
+        String key = discordDedupeKey(ctx);
+        Long last = discordLastSent.get(key);
+
+        if (last != null && (now - last) < windowMs) {
+            return false;
+        }
+
+        // Mark as sent (we do this before async send so concurrent triggers don't double-send)
+        discordLastSent.put(key, now);
+        return true;
+    }
+
+    private void pruneDiscordDedupeIfNeeded(){
+        int dedupeMinutes = config.getInt("discord-dedupe-minutes");
+        if (dedupeMinutes <= 0) {
+            return;
+        }
+
+        long cutoff = System.currentTimeMillis() - (dedupeMinutes * 60_000);
+        discordLastSent.entrySet().removeIf(e -> e.getValue() < cutoff);
+    }
 }

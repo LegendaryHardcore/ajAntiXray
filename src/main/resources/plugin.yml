@@ -1,10 +1,13 @@
 main: us.ajg0702.antixray.Main
-name: ajAntiXray
-author: ajgeiss0702
-api-version: 1.13
-description: Detects xrayers and notifys admins
-version: "@VERSION@"
+name: ${pluginName}
+author: ajgeiss0702, thowan-codes
+api-version: 1.21
+description: ${description}
+version: ${version}
 softdepend: [Factions, WorldGuard]
+
+folia-supported: true
+
 commands:
   ajantixray:
     aliases: [xr, aax, ax, ajax]
@@ -16,4 +19,7 @@ commands:
 permissions:
   ajaxr.notify:
     description: Players with this permission will recieve notifications when someone is being suspicious.
+    default: op
+  ajaxr.exempt:
+    description: Players with this permission will not set off notifications
     default: op
